@@ -967,6 +967,43 @@ def _parse_eq_to_pure_multiplication(a_term, shape_a, b_term, shape_b, out):
     )
 
 
+def _parse_eq_to_simplifed_einsum(a_term, b_term, out):
+    """If the contraction is very low arithmetic intensity (ratio of
+    multiplications to total size of inputs and output) then the advantages of
+    batched matrix multiplication do not overcome the overhead of transposing
+    and reshaping. However, we still want to remove any repeated and trivial
+    indices first, rather than passing to the pairwise c einsum call.
+    """
+    # handle reptitions and use as sets
+    desired_a = dict.fromkeys(a_term)
+    desired_b = dict.fromkeys(b_term)
+
+    # remove trivially summed indives (only on one input and not output)
+    for ix in tuple(desired_a.keys()):
+        if not (ix in desired_b or ix in out):
+            desired_a.pop(ix)
+    for ix in tuple(desired_b.keys()):
+        if not (ix in desired_a or ix in out):
+            desired_b.pop(ix)
+
+    desired_a = "".join(desired_a.keys())
+    desired_b = "".join(desired_b.keys())
+
+    eq_a = f"{a_term}->{desired_a}"
+    eq_b = f"{b_term}->{desired_b}"
+    eq_ab = f"{desired_a},{desired_b}->{out}"
+
+    return (
+        eq_a,
+        eq_b,
+        None,  # new_shape_a, not needed
+        None,  # new_shape_b, not needed
+        None,  # new_shape_ab, not needed
+        None,  # perm_ab, not needed
+        eq_ab,
+    )
+
+
 @functools.lru_cache(2**12)
 def _parse_eq_to_batch_matmul(eq, shape_a, shape_b):
     """Cached parsing of a two term einsum equation into the necessary
@@ -995,6 +1032,12 @@ def _parse_eq_to_batch_matmul(eq, shape_a, shape_b):
     sizes = {}
     singletons = set()
 
+    # use these to estimate arithmetic intensity
+    cost = 1
+    sizea = 1
+    sizeb = 1
+    sizeo = 1
+
     # parse left term
     seen = set()
     for ix, d in zip(a_term, shape_a):
@@ -1017,10 +1060,19 @@ def _parse_eq_to_batch_matmul(eq, shape_a, shape_b):
 
         if ix in b_term:
             if ix in out:
+                # batch index
                 bat_inds.append(ix)
             else:
+                # contracted index
+                cost *= d
+                sizea *= d
+                sizeb *= d
                 con_inds.append(ix)
         elif ix in out:
+            # left kept index
+            cost *= d
+            sizea *= d
+            sizeo *= d
             a_keep.append(ix)
 
     # parse right term
@@ -1044,6 +1096,10 @@ def _parse_eq_to_batch_matmul(eq, shape_a, shape_b):
 
         if ix not in a_term:
             if ix in out:
+                # right kept index
+                cost *= d
+                sizeb *= d
+                sizeo *= d
                 b_keep.append(ix)
 
     if not con_inds:
@@ -1051,6 +1107,11 @@ def _parse_eq_to_batch_matmul(eq, shape_a, shape_b):
         return _parse_eq_to_pure_multiplication(
             a_term, shape_a, b_term, shape_b, out
         )
+
+    if cost < 2 * (sizea + sizeb + sizeo):
+        # very low arithmetic intensity, best to just use einsum,
+        # though still want individual term preparations first
+        return _parse_eq_to_simplifed_einsum(a_term, b_term, out)
 
     # only need the size one indices that appear in the output
     singletons = [ix for ix in out if ix in singletons]
@@ -1194,6 +1255,14 @@ def bmm_einsum(eq, a, b, out=None, **kwargs):
         b = c_einsum(eq_b, b)
     if new_shape_b is not None:
         b = reshape(b, new_shape_b)
+
+    if isinstance(pure_multiplication, str):
+        # very low arithmetic intensity case, just do einsum directly now
+        if output_order is not None:
+            kwargs["order"] = output_order
+        if out is not None:
+            kwargs["out"] = out
+        return c_einsum(pure_multiplication, a, b, **kwargs)
 
     if pure_multiplication:
         # no contracted indices
